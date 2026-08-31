@@ -1,0 +1,30 @@
+{
+  "mae_minutes": 14.75,
+  "test_rmse_minutes": 29.49,
+  "current_delay_min_lag1_correlation_real_rows": 0.9048,
+  "delay_propagation_coefficient_empirical": 0.9924,
+  "trained_on_records": 12650,
+  "real_train_records": 1150,
+  "augmented_train_records": 11500,
+  "test_records": 280,
+  "target_label": "target_next_station_delay",
+  "n_features": 15,
+  "feature_importance": {
+    "distance_km": 2132.0,
+    "remaining_distance_km": 1950.0,
+    "pct_journey_completed": 1342.0,
+    "train_priority": 179.0,
+    "scheduled_halt_duration_min": 720.0,
+    "current_delay_min": 1100.0,
+    "station_hist_avg_delay": 2277.0,
+    "train_hist_avg_delay": 1618.0,
+    "hist_delay_lag1": 183.0,
+    "hist_delay_lag2": 2013.0,
+    "section_delay_gradient": 905.0,
+    "station_congestion_index": 1582.0,
+    "delay_vs_historical": 453.0,
+    "hour_sin": 1006.0,
+    "hour_cos": 940.0
+  },
+  "last_trained": "2026-08-27"
+}
