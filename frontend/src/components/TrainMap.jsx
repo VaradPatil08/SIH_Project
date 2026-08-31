@@ -4,6 +4,7 @@ import L from 'leaflet';
 import { Navigation, Maximize2, Gauge, Layers, Eye } from 'lucide-react';
 import { useSettings } from '../context/SettingsContext';
 import { getTrainColor } from '../utils/trainColors';
+import { useDeadReckonedPosition } from '../hooks/useDeadReckonedPosition';
 
 // Fix standard Leaflet default icon path issues
 delete L.Icon.Default.prototype._getIconUrl;
@@ -165,6 +166,80 @@ function createLiveTrainIcon(trainNumber, speed, colorHex, isFocused = false, is
     iconSize: [84, 38],
     iconAnchor: [42, 38],
   });
+}
+
+/**
+ * Individual Train Locomotive Marker component with dead reckoning hook support.
+ */
+function TrainLocomotiveMarker({ train, colorHex, isFocused, isDark, onFocusTrain, t }) {
+  const displayPosition = useDeadReckonedPosition(train.currentPosition);
+  if (!displayPosition?.lat || !displayPosition?.lng) return null;
+
+  const isRailRadar = displayPosition.source === 'railradar';
+
+  return (
+    <Marker
+      position={[displayPosition.lat, displayPosition.lng]}
+      icon={createLiveTrainIcon(train.trainNumber, displayPosition.speed_kmh, colorHex, isFocused, isDark)}
+      zIndexOffset={isFocused ? 1000 : 500}
+    >
+      <Popup autoPan={false}>
+        <div className="font-sans text-xs space-y-1.5 min-w-[220px] text-foreground dark:text-slate-100">
+          <div className="flex items-center justify-between border-b border-border dark:border-slate-700 pb-1">
+            <span className="font-bold text-xs" style={{ color: colorHex }}>
+              #{train.trainNumber} {train.trainName}
+            </span>
+            <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+              isRailRadar
+                ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
+                : 'bg-transit-green-light dark:bg-emerald-950 text-transit-green dark:text-emerald-400'
+            }`}>
+              {isRailRadar ? 'RailRadar Live' : t('liveTrack')}
+            </span>
+          </div>
+          <div className="space-y-1 text-[11px] text-muted dark:text-slate-400">
+            <div className="flex justify-between">
+              <span>{t('currentSpeed')}:</span>
+              <span className="font-bold" style={{ color: colorHex }}>
+                {displayPosition.speed_kmh || 0} {t('km')}/h
+              </span>
+            </div>
+            {displayPosition.bearing_degrees != null && (
+              <div className="flex justify-between">
+                <span>Bearing:</span>
+                <span className="font-semibold text-foreground dark:text-slate-200">
+                  {Math.round(displayPosition.bearing_degrees)}°
+                </span>
+              </div>
+            )}
+            {displayPosition.next_station_name && (
+              <div className="flex justify-between">
+                <span>{t('nextStation')}:</span>
+                <span className="font-semibold text-foreground dark:text-slate-200">
+                  {displayPosition.next_station_name}
+                </span>
+              </div>
+            )}
+            {isRailRadar && displayPosition.synced_at && (
+              <div className="flex justify-between text-[10px] text-slate-500 dark:text-slate-400 pt-0.5 border-t border-border dark:border-slate-800">
+                <span>Synced At:</span>
+                <span>{new Date(displayPosition.synced_at).toLocaleTimeString()}</span>
+              </div>
+            )}
+          </div>
+          <div className="pt-1 border-t border-border dark:border-slate-700 flex justify-end">
+            <button
+              type="button"
+              onClick={() => onFocusTrain && onFocusTrain(train.trainNumber)}
+              className="px-2 py-0.5 rounded text-[10px] font-semibold text-navy dark:text-blue-400 hover:underline"
+            >
+              Focus Timeline & Metrics
+            </button>
+          </div>
+        </div>
+      </Popup>
+    </Marker>
+  );
 }
 
 export default function TrainMap({ 
@@ -452,52 +527,15 @@ export default function TrainMap({
                 );
               })}
 
-              {/* Live Locomotive Marker */}
-              {train.currentPosition?.lat && train.currentPosition?.lng && (
-                <Marker
-                  position={[train.currentPosition.lat, train.currentPosition.lng]}
-                  icon={createLiveTrainIcon(train.trainNumber, train.currentPosition.speed_kmh, colorHex, isFocused, isDark)}
-                  zIndexOffset={isFocused ? 1000 : 500}
-                >
-                  <Popup autoPan={false}>
-                    <div className="font-sans text-xs space-y-1.5 min-w-[220px] text-foreground dark:text-slate-100">
-                      <div className="flex items-center justify-between border-b border-border dark:border-slate-700 pb-1">
-                        <span className="font-bold text-xs" style={{ color: colorHex }}>
-                          #{train.trainNumber} {train.trainName}
-                        </span>
-                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-transit-green-light dark:bg-emerald-950 text-transit-green dark:text-emerald-400 font-bold">
-                          {t('liveTrack')}
-                        </span>
-                      </div>
-                      <div className="space-y-1 text-[11px] text-muted dark:text-slate-400">
-                        <div className="flex justify-between">
-                          <span>{t('currentSpeed')}:</span>
-                          <span className="font-bold" style={{ color: colorHex }}>
-                            {train.currentPosition.speed_kmh || 0} {t('km')}/h
-                          </span>
-                        </div>
-                        {train.currentPosition.next_station_name && (
-                          <div className="flex justify-between">
-                            <span>{t('nextStation')}:</span>
-                            <span className="font-semibold text-foreground dark:text-slate-200">
-                              {train.currentPosition.next_station_name}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                      <div className="pt-1 border-t border-border dark:border-slate-700 flex justify-end">
-                        <button
-                          type="button"
-                          onClick={() => onFocusTrain && onFocusTrain(train.trainNumber)}
-                          className="px-2 py-0.5 rounded text-[10px] font-semibold text-navy dark:text-blue-400 hover:underline"
-                        >
-                          Focus Timeline & Metrics
-                        </button>
-                      </div>
-                    </div>
-                  </Popup>
-                </Marker>
-              )}
+              {/* Live Locomotive Marker with Dead Reckoning */}
+              <TrainLocomotiveMarker
+                train={train}
+                colorHex={colorHex}
+                isFocused={isFocused}
+                isDark={isDark}
+                onFocusTrain={onFocusTrain}
+                t={t}
+              />
 
             </React.Fragment>
           );

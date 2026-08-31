@@ -17,7 +17,7 @@ import {
   Loader2,
   Info
 } from 'lucide-react';
-import { getTrainETA, getDisruptionReportSummary, getTrainsSearch } from '../services/api';
+import { getTrainETA, getDisruptionReportSummary, getTrainsSearch, activateLiveTracking } from '../services/api';
 import TrainMap from '../components/TrainMap';
 import StationTimeline from '../components/StationTimeline';
 import DelaySparkline from '../components/DelaySparkline';
@@ -82,9 +82,21 @@ export default function TrackingPage() {
   const [addSearchLoading, setAddSearchLoading] = useState(false);
   const addSearchDebounce = useRef(null);
   const addSearchContainerRef = useRef(null);
+  const activatedTrainsRef = useRef(new Set());
 
   const timerRef = useRef(null);
   const countdownRef = useRef(null);
+
+  // Trigger one-time RailRadar live telemetry sync when trains are activated
+  useEffect(() => {
+    trackedTrainNumbers.forEach((num) => {
+      const clean = String(num || '').trim();
+      if (clean && !activatedTrainsRef.current.has(clean)) {
+        activatedTrainsRef.current.add(clean);
+        activateLiveTracking(clean);
+      }
+    });
+  }, [trackedTrainNumbers]);
 
   // Fetch all tracked trains in parallel
   const fetchAllTelemetry = useCallback(async (isBackground = false) => {
@@ -186,6 +198,11 @@ export default function TrackingPage() {
       setIsAddSearchOpen(false);
       setAddSearchQuery('');
       return;
+    }
+
+    if (!activatedTrainsRef.current.has(cleanNum)) {
+      activatedTrainsRef.current.add(cleanNum);
+      activateLiveTracking(cleanNum);
     }
 
     const currentCompareList = compareParam

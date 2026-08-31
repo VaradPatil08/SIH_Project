@@ -3,7 +3,7 @@ Pydantic schemas — this file defines the API contract between frontend and bac
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Union
 
 
 class Station(BaseModel):
@@ -39,11 +39,27 @@ class TrainSummary(BaseModel):
 class CurrentPosition(BaseModel):
     lat: float
     lng: float
-    speed_kmh: int
+    speed_kmh: Union[int, float]
     last_updated: str
     next_station_code: str
     next_station_name: str
-    distance_to_next_km: int
+    distance_to_next_km: Union[int, float]
+    bearing_degrees: Optional[float] = None
+    synced_at: Optional[str] = None
+    source: str = "simulated"  # "simulated" | "railradar"
+
+
+class LiveSyncResponse(BaseModel):
+    train_number: str
+    lat: float
+    lng: float
+    speed_kmh: float
+    bearing_degrees: Optional[float] = None
+    next_station_code: Optional[str] = None
+    next_station_name: Optional[str] = None
+    distance_to_next_km: Optional[float] = None
+    source: str = "simulated"  # "railradar" | "simulated"
+    synced_at: str
 
 
 class TrainETAResponse(BaseModel):
@@ -86,4 +102,3 @@ class StationArrivalItem(BaseModel):
     halt_min: int
     status: str
     direction: str
-

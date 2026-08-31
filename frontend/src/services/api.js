@@ -833,3 +833,27 @@ export async function getAdminStationArrivals(stationCode, authToken) {
   }
 }
 
+/**
+ * 16. LIVE SYNC: POST /trains/{train_number}/live/sync
+ * Triggers a one-time RailRadar live telemetry sync when user adds a train to tracking.
+ * Fire-and-forget: Catches and logs errors without failing the UI.
+ */
+export async function activateLiveTracking(trainNumber) {
+  const cleanNum = String(trainNumber || '').trim();
+  if (!cleanNum) return null;
+  try {
+    const res = await fetchWithTimeout(`${BASE_URL}/trains/${cleanNum}/live/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }, 3500);
+    if (!res.ok) {
+      console.warn(`[RailPulse API] activateLiveTracking HTTP ${res.status} for train ${cleanNum}`);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    console.warn(`[RailPulse API] activateLiveTracking failed for train ${cleanNum} (falling back to simulator):`, err.message);
+    return null;
+  }
+}
+

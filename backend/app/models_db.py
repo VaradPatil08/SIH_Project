@@ -1,7 +1,7 @@
 import datetime
 import uuid
 
-from sqlalchemy import Column, String, DateTime, ForeignKey, Boolean, Integer
+from sqlalchemy import Column, String, DateTime, ForeignKey, Boolean, Integer, Float, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.db import Base
@@ -51,11 +51,6 @@ class Report(Base):
 class OTPCode(Base):
     """
     Short-lived OTP codes for phone verification.
-
-    NOTE: this only prevents trivial spam/bot submissions by requiring
-    control of a phone number — it does NOT verify that a report's
-    CONTENT is true. Never describe this as "verified accurate" in the
-    product or pitch; it's spam prevention, not fact-checking.
     """
     __tablename__ = "otp_codes"
 
@@ -65,3 +60,38 @@ class OTPCode(Base):
     expires_at = Column(DateTime, nullable=False)
     verified = Column(Boolean, default=False)
     attempts = Column(Integer, default=0)
+
+
+class TrainLiveCache(Base):
+    """
+    Server-side shared live position cache for trains synced with RailRadar or Simulator.
+    Shared across every visitor to conserve API quotas and provide synchronized telemetry.
+    """
+    __tablename__ = "train_live_cache"
+
+    train_number = Column(String, primary_key=True, index=True)
+    source = Column(String, nullable=False, default="simulated")  # "railradar" | "simulated"
+    synced_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    lat = Column(Float, nullable=False)
+    lng = Column(Float, nullable=False)
+    speed_kmh = Column(Float, nullable=False, default=0.0)
+    bearing_degrees = Column(Float, nullable=True)
+    next_station_code = Column(String, nullable=True)
+    next_station_name = Column(String, nullable=True)
+    distance_to_next_km = Column(Float, nullable=True)
+    raw_response = Column(Text, nullable=True)
+
+
+class ApiQuotaUsage(Base):
+    """
+    Tracks external API provider quota usage per month (e.g. RailRadar 1000 req/month limit).
+    """
+    __tablename__ = "api_quota_usage"
+    __table_args__ = (
+        UniqueConstraint("provider", "month_key", name="uq_provider_month"),
+    )
+
+    id = Column(String, primary_key=True, default=_uuid)
+    provider = Column(String, nullable=False, index=True)
+    month_key = Column(String, nullable=False, index=True)  # Format: "YYYY-MM"
+    request_count = Column(Integer, nullable=False, default=0)

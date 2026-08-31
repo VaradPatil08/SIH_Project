@@ -1,13 +1,19 @@
+import datetime
 import json
 import math
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
 
+from app.config import RAILRADAR_CACHE_TTL_SECONDS
+from app.db import get_db
+from app.models_db import TrainLiveCache
 from app.models.schemas import (
     CurrentPosition,
     DelayReasonsResponse,
+    LiveSyncResponse,
     ModelMetrics,
     Station,
     StationETA,
@@ -15,7 +21,13 @@ from app.models.schemas import (
     TrainRouteResponse,
     TrainSummary,
 )
-from app.services import eta, live_feed
+from app.services import (
+    eta,
+    live_feed,
+    quota_guard,
+    railradar_client,
+    railradar_interpolation,
+)
 
 router = APIRouter(tags=["trains"])
 
@@ -33,14 +45,12 @@ def search_trains(
     limit: int = Query(20, ge=1, le=50, description="Max results (1–50, default 20)"),
 ):
     """
-    Full-network search across all 9,525 trains.
+    Full-network search across all trains.
     Case-insensitive match on train_number (prefix/exact) or name/origin/destination (substring).
-    This is the ONLY endpoint that should surface non-featured trains — never dump the full set.
     """
     ql = q.strip().lower()
     if len(ql) < 2:
-        from fastapi import HTTPException as _HTTPException
-        raise _HTTPException(status_code=400, detail="Query must be at least 2 characters.")
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters.")
 
     results = []
     for t in _MOCK_TRAINS.values():
@@ -70,14 +80,13 @@ def search_trains(
 
 
 @router.get("/trains", response_model=list[TrainSummary])
-def list_trains(featured: bool | None = Query(None, description="If true (default), return only featured flagship homepage trains (6 trains). Pass false to return the full network — large response, use deliberately.")):
-    """
-    Returns train list.
-    - Default (no param): returns only the 6 curated featured trains — fast, suitable for homepage.
-    - ?featured=true: same as default.
-    - ?featured=false: returns full 9,525-train network — large, use only when explicitly needed.
-    Use GET /trains/search?q=... to search the full network without loading it all at once.
-    """
+def list_trains(
+    featured: bool | None = Query(
+        None,
+        description="If true (default), return only featured flagship homepage trains. Pass false to return full network.",
+    )
+):
+    """Returns train list (curated featured trains by default)."""
     show_featured_only = featured if featured is not None else True
     return [
         TrainSummary(
@@ -95,7 +104,6 @@ def list_trains(featured: bool | None = Query(None, description="If true (defaul
         for t in _MOCK_TRAINS.values()
         if bool(t.get("featured", False)) == show_featured_only
     ]
-
 
 
 @router.get("/trains/{train_number}/route", response_model=TrainRouteResponse)
@@ -128,106 +136,252 @@ def _compute_base_delay(
     stations: list[dict],
     elapsed_min: float,
 ) -> int:
-    """
-    Computes a smoothly-evolving delay estimate for the whole journey — NOT
-    per-segment, so it never resets to zero when current_station_index advances.
-
-    FIX for the sawtooth problem:
-        The old code used `sim_delay = elapsed_min - scheduled_offset_at_current_station`.
-        This collapsed to ~0 every time the station index advanced, because the new
-        station's own scheduled_offset becomes the denominator. The result was a
-        sawtooth wave instead of a continuous signal.
-
-    NEW APPROACH — smooth bounded random-walk keyed by (train_number, journey fraction):
-        1. Seed a historical base from the ML lookup table (per-train chronic delay)
-        2. Add a slow sinusoidal perturbation (period = total journey), so delay rises and
-           falls naturally across the route — not per-station resets
-        3. Add a very slow random-walk component driven by a hash of
-           (train_number, coarse_time_bucket) so each train has its own independent
-           delay trajectory, and adjacent polls produce adjacent values (no jumps)
-
-    The result is a signal that:
-        • Is different per train (seeded by hist_lag per train)
-        • Varies continuously across the journey (sinusoidal wave)
-        • Drifts slowly over real time (random-walk bucket)
-        • Never resets to 0 on station-crossing
-        • Is bounded to [hist_base * 0.3, hist_base * 2.2] so it stays realistic
-    """
+    """Computes a smoothly-evolving delay estimate for the whole journey."""
     hist = eta._hist_averages or {}
     global_avg = float(hist.get("global_avg", 20.0))
     tid = str(train_number).zfill(5)
 
-    # 1. Historical base: this train's chronic delay profile
     train_avg = float(hist.get("train", {}).get(tid, global_avg))
-    # Clamp to a realistic range (some trains have 0.0 from sparse data)
     hist_base = max(8.0, min(train_avg, 60.0))
 
-    # 2. Journey-progress sinusoidal component.
-    #    One full sine cycle over the whole journey duration — delay rises in the
-    #    middle of a long run and recovers near the destination. Amplitude = 30% of base.
     total_min = float(stations[-1].get("scheduled_offset_min", 1000) or 1000)
-    phase = (elapsed_min / total_min) * 2.0 * math.pi  # 0 → 2π across the journey
-    sine_component = hist_base * 0.30 * math.sin(phase)  # ±30% of base
+    phase = (elapsed_min / total_min) * 2.0 * math.pi
+    sine_component = hist_base * 0.30 * math.sin(phase)
 
-    # 3. Slow random-walk: bucket size = 4 real minutes (40 simulated minutes at 10×).
-    #    Each bucket gets a stable offset derived from a deterministic hash, so
-    #    consecutive polls in the same bucket see the same value (no inter-poll jumps).
-    #    The hash uses train_number as a seed so different trains drift independently.
     real_elapsed = time.time() - _DELAY_SIM_START
-    bucket = int(real_elapsed // 240)  # changes every 4 real minutes
-    # Deterministic pseudo-random from (train_id, bucket) — no import of random needed
-    hash_val = hash(f"{train_number}:{bucket}") % 1000  # 0..999
-    walk_component = hist_base * 0.25 * (hash_val / 500.0 - 1.0)  # ±25% of base
+    bucket = int(real_elapsed // 240)
+    hash_val = hash(f"{train_number}:{bucket}") % 1000
+    walk_component = hist_base * 0.25 * (hash_val / 500.0 - 1.0)
 
     raw = hist_base + sine_component + walk_component
+    return max(int(hist_base * 0.3), min(round(raw), int(hist_base * 2.2)))
 
-    # Clamp to a realistic delay range
-    result = max(int(hist_base * 0.3), min(round(raw), int(hist_base * 2.2)))
-    return result
+
+@router.post("/trains/{train_number}/live/sync", response_model=LiveSyncResponse)
+@router.post("/train/{train_number}/live/sync", response_model=LiveSyncResponse)
+def sync_train_live(train_number: str, db: Session = Depends(get_db)):
+    """
+    Explicit one-time sync endpoint triggered when a user adds a train to tracking.
+    1. Checks shared DB cache for fresh snapshot within TTL window (shared across all users).
+    2. Checks monthly quota guard before calling external RailRadar API.
+    3. Degrades gracefully to the simulator on budget exhaustion, network errors, or route mismatches.
+    """
+    clean_num = str(train_number).strip()
+    train = _MOCK_TRAINS.get(clean_num)
+    if not train:
+        raise HTTPException(status_code=404, detail=f"Unknown train {clean_num}")
+
+    now = datetime.datetime.utcnow()
+    stations = train["stations"]
+
+    # 1. Check shared DB cache
+    cached = db.query(TrainLiveCache).filter(TrainLiveCache.train_number == clean_num).first()
+    if cached:
+        age_seconds = (now - cached.synced_at).total_seconds()
+        if age_seconds < RAILRADAR_CACHE_TTL_SECONDS:
+            return LiveSyncResponse(
+                train_number=clean_num,
+                lat=cached.lat,
+                lng=cached.lng,
+                speed_kmh=cached.speed_kmh,
+                bearing_degrees=cached.bearing_degrees,
+                next_station_code=cached.next_station_code,
+                next_station_name=cached.next_station_name,
+                distance_to_next_km=cached.distance_to_next_km,
+                source=cached.source,
+                synced_at=cached.synced_at.isoformat(),
+            )
+
+    # 2. Check quota budget before outbound call
+    if not quota_guard.has_budget(db):
+        sim_pos, _, _ = live_feed.get_live_position_and_state(
+            stations,
+            train_number=clean_num,
+            start_offset_min=train.get("sim_start_offset_min", 0),
+        )
+        return LiveSyncResponse(
+            train_number=clean_num,
+            lat=sim_pos["lat"],
+            lng=sim_pos["lng"],
+            speed_kmh=sim_pos["speed_kmh"],
+            bearing_degrees=None,
+            next_station_code=sim_pos.get("next_station_code"),
+            next_station_name=sim_pos.get("next_station_name"),
+            distance_to_next_km=sim_pos.get("distance_to_next_km"),
+            source="simulated",
+            synced_at=now.isoformat(),
+        )
+
+    # 3. Fetch from RailRadar API
+    raw_data = railradar_client.fetch_live(clean_num, db)
+    if raw_data:
+        interpolated = railradar_interpolation.interpolate_railradar_position(raw_data, stations)
+        if interpolated:
+            # Upsert cache with real RailRadar telemetry
+            if cached:
+                cached.source = "railradar"
+                cached.synced_at = now
+                cached.lat = interpolated["lat"]
+                cached.lng = interpolated["lng"]
+                cached.speed_kmh = interpolated["speed_kmh"]
+                cached.bearing_degrees = interpolated.get("bearing_degrees")
+                cached.next_station_code = interpolated.get("next_station_code")
+                cached.next_station_name = interpolated.get("next_station_name")
+                cached.distance_to_next_km = interpolated.get("distance_to_next_km")
+                cached.raw_response = json.dumps(raw_data)
+            else:
+                cached = TrainLiveCache(
+                    train_number=clean_num,
+                    source="railradar",
+                    synced_at=now,
+                    lat=interpolated["lat"],
+                    lng=interpolated["lng"],
+                    speed_kmh=interpolated["speed_kmh"],
+                    bearing_degrees=interpolated.get("bearing_degrees"),
+                    next_station_code=interpolated.get("next_station_code"),
+                    next_station_name=interpolated.get("next_station_name"),
+                    distance_to_next_km=interpolated.get("distance_to_next_km"),
+                    raw_response=json.dumps(raw_data),
+                )
+                db.add(cached)
+            db.commit()
+
+            return LiveSyncResponse(
+                train_number=clean_num,
+                lat=interpolated["lat"],
+                lng=interpolated["lng"],
+                speed_kmh=interpolated["speed_kmh"],
+                bearing_degrees=interpolated.get("bearing_degrees"),
+                next_station_code=interpolated.get("next_station_code"),
+                next_station_name=interpolated.get("next_station_name"),
+                distance_to_next_km=interpolated.get("distance_to_next_km"),
+                source="railradar",
+                synced_at=now.isoformat(),
+            )
+
+    # Fallback to simulated position if RailRadar failed, unmapped route, or offline
+    sim_pos, _, _ = live_feed.get_live_position_and_state(
+        stations,
+        train_number=clean_num,
+        start_offset_min=train.get("sim_start_offset_min", 0),
+    )
+
+    if cached:
+        cached.source = "simulated"
+        cached.synced_at = now
+        cached.lat = sim_pos["lat"]
+        cached.lng = sim_pos["lng"]
+        cached.speed_kmh = sim_pos["speed_kmh"]
+        cached.bearing_degrees = None
+        cached.next_station_code = sim_pos.get("next_station_code")
+        cached.next_station_name = sim_pos.get("next_station_name")
+        cached.distance_to_next_km = sim_pos.get("distance_to_next_km")
+        cached.raw_response = None
+    else:
+        cached = TrainLiveCache(
+            train_number=clean_num,
+            source="simulated",
+            synced_at=now,
+            lat=sim_pos["lat"],
+            lng=sim_pos["lng"],
+            speed_kmh=sim_pos["speed_kmh"],
+            bearing_degrees=None,
+            next_station_code=sim_pos.get("next_station_code"),
+            next_station_name=sim_pos.get("next_station_name"),
+            distance_to_next_km=sim_pos.get("distance_to_next_km"),
+            raw_response=None,
+        )
+        db.add(cached)
+    db.commit()
+
+    return LiveSyncResponse(
+        train_number=clean_num,
+        lat=sim_pos["lat"],
+        lng=sim_pos["lng"],
+        speed_kmh=sim_pos["speed_kmh"],
+        bearing_degrees=None,
+        next_station_code=sim_pos.get("next_station_code"),
+        next_station_name=sim_pos.get("next_station_name"),
+        distance_to_next_km=sim_pos.get("distance_to_next_km"),
+        source="simulated",
+        synced_at=now.isoformat(),
+    )
 
 
 @router.get("/trains/{train_number}/eta", response_model=TrainETAResponse)
 @router.get("/train/{train_number}/eta", response_model=TrainETAResponse)
-def get_train_eta(train_number: str):
+def get_train_eta(train_number: str, db: Session = Depends(get_db)):
     """
-    Main endpoint the live tracking page uses:
-    Calculates interpolated current position, live speed, and station-level delay predictions.
+    Main endpoint the live tracking page polls every 6 seconds.
+    MUST NEVER call RailRadar directly — satisfies position from TrainLiveCache or the simulator.
     """
-    train = _MOCK_TRAINS.get(train_number)
+    clean_num = str(train_number).strip()
+    train = _MOCK_TRAINS.get(clean_num)
     if not train:
-        raise HTTPException(status_code=404, detail=f"Unknown train {train_number}")
+        raise HTTPException(status_code=404, detail=f"Unknown train {clean_num}")
 
     stations = train["stations"]
-
-    # Pass per-train sim_start_offset_min so trains on shared corridors
-    # (e.g. MMCT→BVI is on both 12951 and 12009) appear at different positions.
     sim_offset = train.get("sim_start_offset_min", 0)
-    position, elapsed_min, current_station_index = live_feed.get_live_position_and_state(
-        stations,
-        train_number=train_number,
-        start_offset_min=sim_offset,
-    )
+
+    # 1. Check for valid RailRadar live cache
+    now = datetime.datetime.utcnow()
+    cached = db.query(TrainLiveCache).filter(TrainLiveCache.train_number == clean_num).first()
+    
+    use_railradar = False
+    if cached and cached.source == "railradar":
+        age_seconds = (now - cached.synced_at).total_seconds()
+        if age_seconds < RAILRADAR_CACHE_TTL_SECONDS:
+            use_railradar = True
+
+    if use_railradar and cached:
+        position = {
+            "lat": cached.lat,
+            "lng": cached.lng,
+            "speed_kmh": cached.speed_kmh,
+            "last_updated": cached.synced_at.strftime("%I:%M:%S %p"),
+            "next_station_code": cached.next_station_code or stations[-1]["code"],
+            "next_station_name": cached.next_station_name or stations[-1]["name"],
+            "distance_to_next_km": cached.distance_to_next_km or 0.0,
+            "bearing_degrees": cached.bearing_degrees,
+            "synced_at": cached.synced_at.isoformat(),
+            "source": "railradar",
+        }
+        # Approximate current station index & elapsed journey for delay propagation
+        _, elapsed_min, current_station_index = live_feed.get_live_position_and_state(
+            stations,
+            train_number=clean_num,
+            start_offset_min=sim_offset,
+        )
+    else:
+        sim_pos, elapsed_min, current_station_index = live_feed.get_live_position_and_state(
+            stations,
+            train_number=clean_num,
+            start_offset_min=sim_offset,
+        )
+        position = {
+            **sim_pos,
+            "bearing_degrees": None,
+            "synced_at": None,
+            "source": "simulated",
+        }
 
     # Ensure the ETA model's historical averages are loaded
     eta._try_load_model()
 
-    # Continuously-evolving delay estimate — no per-station sawtooth resets
-    base_delay = _compute_base_delay(train_number, stations, float(elapsed_min))
+    # Continuously-evolving delay estimate
+    base_delay = _compute_base_delay(clean_num, stations, float(elapsed_min))
 
     station_etas = []
     for idx, st in enumerate(stations):
         if idx < current_station_index:
-            # Already-passed stations: reconstruct a plausible decaying historic delay
             status = "reached"
             delay = 0 if idx == 0 else max(0, base_delay - (current_station_index - idx) * 2)
         elif idx == current_station_index:
-            # Current station: use the evolved delay
             status = "delayed" if base_delay > 2 else "on_time"
             delay = base_delay
         else:
-            # Future stations: ML model predicts given current incoming delay
             delay, _ = eta.predict_delay_minutes(
-                train_number=train_number,
+                train_number=clean_num,
                 station_code=st["code"],
                 distance_km=st.get("distance_km", 0),
                 current_delay_min=base_delay,
